@@ -237,6 +237,14 @@ def call_chat(conf: dict, messages: list, *, resolution: dict | None = None,
     """
     _ = resolution
     conf = conf or {}
+    # 模型级附加参数：允许在模型配置里写 body，例如关闭思考
+    #   "extra_body": {"thinking": {"type": "disabled"}}
+    # 调用方显式传的 extra_body 优先，配置里的作为底座。
+    cfg_extra = conf.get("extra_body")
+    if isinstance(cfg_extra, dict) and cfg_extra:
+        merged = dict(cfg_extra)
+        merged.update(extra_body or {})
+        extra_body = merged
     use_stream = bool(conf.get("stream", False)) if stream is None else bool(stream)
     if on_delta is not None:
         use_stream = True          # 要实时进度就必须流式

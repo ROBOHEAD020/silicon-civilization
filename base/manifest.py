@@ -27,7 +27,7 @@ def file_digest(path: str) -> str:
 
 
 _COMPARE_KEYS = ("plugin", "scenario", "scenario_digest", "config", "seats",
-                 "seeds", "metrics", "model_specs")
+                 "seat_assign", "seeds", "metrics", "model_specs")
 
 
 def compare(a: dict, b: dict) -> list:
@@ -38,14 +38,21 @@ def compare(a: dict, b: dict) -> list:
 
 def freeze(*, plugin: str, scenario: str, config: dict, seats,
            seeds, metrics, notes: str = "", created: str | None = None,
-           scenario_path: str = "", model_specs=None) -> dict:
-    """生成冻结清单：内容哈希一旦变化即视为"改过条件"。"""
+           scenario_path: str = "", model_specs=None,
+           seat_assign: dict | None = None) -> dict:
+    """生成冻结清单：内容哈希一旦变化即视为"改过条件"。
+
+    seat_assign 记录"每个轮换条件下，哪个模型坐了哪个座位"。seats 字段只记
+    基准顺序，看不出轮换后谁演了谁——而"哪家公司演了哪个角色"恰恰是这类实验
+    最需要被冻结、也最容易被事后含糊过去的东西，所以它单独成字段并计入哈希。
+    """
     body = {
         "plugin": plugin,
         "scenario": scenario,
         "config": config,
         "seats": [s if isinstance(s, str) else (s.get("model_id") or s.get("model"))
                   for s in seats],
+        "seat_assign": dict(seat_assign or {}),
         "seeds": list(seeds),
         "metrics": list(metrics),
         "scenario_digest": file_digest(scenario_path) if scenario_path else "",

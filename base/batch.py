@@ -69,8 +69,117 @@ def condition_name(cond: dict) -> str:
     return "_".join(parts)
 
 
-def plan_runs(batch_id: str, sweep: dict, seeds) -> list:
+# ---------- 座位 ↔ 模型轮换（拉丁方） ----------
+# 如果每个批次都用同一个"座位 → 模型"对应关系，那么"模型差异"与"角色差异"
+# 就完全混淆：V1 永远演 1 号位，观测到的差别既可能是模型价值观，也可能只是
+# 这个位子的角色利益。这是这类实验最常见、也最致命的失效方式。
+#
+# 做法：把轮换写成条件里的一个键（assign），用 sweep 生成，让 manifest 冻结它。
+# 默认置换按 3 个座位定义：
+#   L1: 座位1/2/3 = 模型1/2/3   （恒等）
+#   L2: 座位1/2/3 = 模型3/1/2
+#   L3: 座位1/2/3 = 模型2/3/1
+# 三者合起来，每个模型在每个座位上各出现一次 → 模型主效应与角色主效应可分离。
+ASSIGN_ROTATIONS = {
+    "L1": (0, 1, 2),
+    "L2": (2, 0, 1),
+    "L3": (1, 2, 0),
+    # R1..R3 是同一组置换的别名（核废水场景按 rotation 命名）。
+    # 语义必须逐条相等：R2 就是 L2，不要给它们写不同的置换，否则两套命名会悄悄分叉。
+    "R1": (0, 1, 2),
+    "R2": (2, 0, 1),
+    "R3": (1, 2, 0),
+}
+
+
+def rotation_for(assign) -> tuple:
+    """把条件里的 assign 解析成置换。未知值直接报错，不静默退回恒等。
+
+    静默退回是最危险的失效模式：实验会跑完、报告会生成、数字看起来都正常，
+    只有设计已经悄悄失效了。所以宁可在这里炸。
+    """
+    key = str(assign or "L1").strip()
+    if key not in ASSIGN_ROTATIONS:
+        raise ValueError("未知的座位轮换 assign={!r}，可用：{}".format(
+            key, "、".join(sorted(ASSIGN_ROTATIONS))))
+    return ASSIGN_ROTATIONS[key]
+
+
+def rotate_seats(seats, assign=None) -> list:
+    """按 assign 轮换"座位 → 模型"的对应关系，返回新列表。
+
+    必须返回新列表：seats 是 run_batch 与所有并发线程共享的对象，
+    原地 reorder 会让同时开跑的几局互相污染，而且这种 bug 只在并发数 >1 时出现。
+    """
+    seats = list(seats or [])
+    if not seats:
+        return []
+    # 没指定 assign 就是"不轮换"，而不是"套用默认置换"。
+    # 否则一个 2 个座位、根本没要求轮换的批次，会被 3 座位置换判成配置错误。
+    if assign is None or str(assign).strip() in ("", "none", "None"):
+        return seats
+    perm = rotation_for(assign)
+    if len(seats) != len(perm):
+        raise ValueError(
+            "assign={} 的置换按 {} 个座位定义，但传入了 {} 个；"
+            "请为该座位数在 ASSIGN_ROTATIONS 里补一条置换（不要靠自动外推，"
+            "外推出来的置换未必是真拉丁方）".format(assign or "L1", len(perm), len(seats)))
+    if sorted(perm) != list(range(len(perm))):
+        raise ValueError("assign={} 的置换不是合法排列：{}".format(assign, perm))
+    return [seats[i] for i in perm]
+
+
+def seat_model_map(seats) -> dict:
+    """座位号 → 模型标识；用来把"谁坐了哪个位子"写进结果行与清单。"""
+    out = {}
+    for idx, seat in enumerate(seats or [], start=1):
+        seat = seat or {}
+        conf = seat.get("model_conf") or {}
+        out[str(idx)] = str(conf.get("model") or seat.get("name") or "")
+    return out
+
+
+def model_specs(seats) -> list:
+    """每个座位的模型参数快照（不含密钥）。
+
+    为什么必须冻：temperature、thinking（extra_body）这些值只存在 data/models.json 里，
+    那个文件既不进 git、也不进清单。不冻的话，事后无法证明"当时跑的是思考开、温度 1.0"，
+    预注册就缺了一块——而"改了参数却看不出来"恰恰是这类实验最难查的一种污染。
+    """
     out = []
+    for i, seat in enumerate(seats or [], start=1):
+        seat = seat or {}
+        conf = seat.get("model_conf") or {}
+        out.append({
+            "seat": i,
+            "model": conf.get("model") or seat.get("name") or "",
+            "provider": conf.get("provider") or "",
+            "protocol": conf.get("protocol") or "",
+            "api_base": conf.get("api_base") or "",
+            "temperature": conf.get("temperature"),
+            "max_tokens": conf.get("max_tokens"),
+            "stream": bool(conf.get("stream", False)),
+            "extra_body": conf.get("extra_body") or {},
+        })
+    return out
+
+
+def validate_assigns(sweep: dict, n_seats: int) -> None:
+    """开跑前把 sweep 里所有 assign 值验一遍。
+
+    错在批次启动时暴露一次，而不是在 180 局里各报一次错——后者会产出一份
+    "跑完了、有结果"的报告，只有逐行看 state=error 才发现全废。
+    """
+    for value in (sweep or {}).get("assign") or []:
+        perm = rotation_for(value)
+        if len(perm) != int(n_seats):
+            raise ValueError(
+                "assign={} 需要 {} 个座位，实际给了 {} 个座位".format(
+                    value, len(perm), n_seats))
+
+
+def plan_runs(batch_id: str, sweep: dict, seeds) -> list:
+    out: list = []
     for cond in build_conditions(sweep):
         cname = condition_name(cond)
         for seed in seeds:
@@ -93,11 +202,16 @@ def _execute(plugin, spec, base_config: dict, seats, title: str,
     cfg.update(spec.condition)
     started = time.time()
     row = {"run_id": spec.run_id, "condition": condition_name(spec.condition),
-           "seed": spec.seed, "communication": cfg.get("communication", "on")}
+           "seed": spec.seed, "communication": cfg.get("communication", "on"),
+           "assign": str(cfg.get("assign", "") or "")}
     try:
+        # 每局按 assign 重排座位：同一批次里同一个模型要轮流演不同角色，
+        # 否则"模型差异"与"角色差异"分不开。rotate_seats 返回新列表，不动共享的 seats。
+        run_seats = rotate_seats(seats, cfg.get("assign"))
+        row["seat_models"] = seat_model_map(run_seats)
         label = title or "{} · {} · s{}".format(plugin.name,
                                                 condition_name(spec.condition), spec.seed)
-        session = runner_mod.create_session(spec.run_id, plugin, cfg, seats, label)
+        session = runner_mod.create_session(spec.run_id, plugin, cfg, run_seats, label)
         thread = runner_mod.start(session)
         thread.join(timeout=per_run_timeout)
         row["state"] = session.state
@@ -143,11 +257,20 @@ def run_batch(plugin_id: str, *, seats, base_config: dict | None = None,
     if plugin is None:
         raise ValueError("插件不存在：" + plugin_id)
 
+    seats = list(seats or [])
+    # 条件在开跑前就要验：assign 写错要在这一刻炸一次，而不是之后炸满整个批次
+    validate_assigns(sweep or {}, len(seats))
+    # 把每个 assign 展开成"座位 → 模型"，写进冻结清单
+    seat_assign = {str(value): seat_model_map(rotate_seats(seats, value))
+                   for value in ((sweep or {}).get("assign") or [])}
+
     manifest = manifest_mod.freeze(
         plugin=plugin_id, scenario=str((base_config or {}).get("scenario", "")),
         config=base_config or {}, seats=[s.get("model_conf", {}).get("model") or s.get("name")
                                         for s in seats],
         seeds=list(seeds), metrics=["metrics", "outcome"],
+        seat_assign=seat_assign,
+        model_specs=model_specs(seats),
         notes="sweep=" + str(sweep or {}))
     batch_id = "b" + manifest["digest"][:10]
     out_root = Path(out_root) if out_root else (ROOT / "runs" / "batches")

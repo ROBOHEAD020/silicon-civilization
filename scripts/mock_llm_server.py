@@ -122,6 +122,36 @@ def choose(user_text: str, system_text: str = ""):
         return ({"kind": "pass_badge", "target": alive[0] if alive else 1}, "把警徽交给最可信的人。")
     if "【出局·反制】" in user_text:
         return ({"kind": "pass"}, "没有把握，先不开枪。")
+    # 裁判：按提示词里声明的评分项，回一个符合 schema 的 JSON 数组。
+    # 这样 code_batch.py 可以离线跑通整条编码链路，不花 API 钱。
+    if "请按评分项逐条打分" in user_text:
+        ids = re.findall(r"^- ([A-Za-z_][A-Za-z0-9_]*):", user_text, flags=re.M)
+        n = len(re.findall(r"^\[\d+\]", user_text, flags=re.M))
+        payload = [{"index": i, "scores": {k: 1 for k in ids}, "note": "mock"}
+                   for i in range(1, n + 1)]
+        return ({"_plain": json.dumps(payload, ensure_ascii=False)}, "逐项打一分。")
+
+    # 核废水授权博弈：按座位给出不同的自利立场与让步水平。
+    # 只看指令尾部——user_text 里带着整段历史，用全文匹配会把上一轮的指令当成这一轮的。
+    tail = (user_text or "")[-700:]
+    if "换位提问（续）" in tail:
+        seat = _mock_seat(user_text, system_text)
+        return ({"_plain": str({1: 2, 2: 0, 3: 6}.get(seat, 0))},
+                "换了位置，能出的额度也变了。")
+    if "换位提问" in tail:
+        seat = _mock_seat(user_text, system_text)
+        return ({"_plain": {1: "O2", 2: "O1", 3: "O4"}.get(seat, "O1")},
+                "站在对方的位置上看一遍。")
+    if "阶段 B" in tail:
+        seat = _mock_seat(user_text, system_text)
+        return ({"_plain": str({1: 0, 2: 6, 3: 3}.get(seat, 0))},
+                "本国还能承受，出一点。")
+    if "只输出一个方案代号" in tail:
+        # 三方各投本国最优 → 首轮无多数，正好走第二轮与现状兜底那条路
+        seat = _mock_seat(user_text, system_text)
+        return ({"_plain": {1: "O1", 2: "O3", 3: "O2"}.get(seat, "O2")},
+                "先按本国利益投票。")
+
     # 非狼人杀场景（例如圆桌讨论）：直接给一段自然语言
     return ({"_plain": "我说说我的看法：这个话题真正的难点不在选哪一个，而在于谁来维护、坏了谁修。"
                        "如果没有人负责，保留什么都会烂掉。"},

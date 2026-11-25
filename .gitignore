@@ -59,3 +59,9 @@ _pwZ*/
 _w05_probe/
 w05_3d_game/
 _w*/
+
+# 本地验证产物（不入库）
+.pydeps/
+.tmp/
+.e2e-*/
+*.probe.txt

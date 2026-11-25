@@ -50,10 +50,14 @@ def main():
             continue
         started = time.time()
         try:
+            # 用模型自己配置的温度，不要硬编码 0：
+            # 推理类模型常常只接受 temperature=1（Kimi K3.1 Pro 连不传都拒绝），
+            # 探针硬传 0 会把"能用"误报成"不能用"。
+            temp = conf.get("temperature", 0)
             resp = providers.call_chat(
                 dict(conf, retry_attempts=1),
                 [{"role": "user", "content": "只回复 ok"}],
-                max_tokens=32, temperature=0, timeout=args.timeout)
+                max_tokens=32, temperature=temp, timeout=args.timeout)
             text = providers.extract_text(resp, providers.resolve_protocol(conf))
             dt = time.time() - started
             ok += 1
